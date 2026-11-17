@@ -123,23 +123,9 @@ const server = new FastMCP<SessionData>({
   authenticate: async (request: {
     headers: IncomingHttpHeaders;
   }): Promise<SessionData> => {
-    if (process.env.CLOUD_SERVICE === 'true') {
-      const apiKey = extractApiKey(request.headers);
-
-      if (!apiKey) {
-        throw new Error('Firecrawl API key is required');
-      }
-      return { firecrawlApiKey: apiKey };
-    } else {
-      // For self-hosted instances, API key is optional if FIRECRAWL_API_URL is provided
-      if (!process.env.FIRECRAWL_API_KEY && !process.env.FIRECRAWL_API_URL) {
-        console.error(
-          'Either FIRECRAWL_API_KEY or FIRECRAWL_API_URL must be provided'
-        );
-        process.exit(1);
-      }
-      return { firecrawlApiKey: process.env.FIRECRAWL_API_KEY };
-    }
+    // Self-host mode by default: API key is optional.
+    const apiKey = extractApiKey(request.headers) || process.env.FIRECRAWL_API_KEY;
+    return { firecrawlApiKey: apiKey };
   },
   // Lightweight health endpoint for LB checks
   health: {
@@ -151,9 +137,11 @@ const server = new FastMCP<SessionData>({
 });
 
 function createClient(apiKey?: string): FirecrawlApp {
+  const apiUrl = process.env.FIRECRAWL_API_URL || 'http://localhost:3002';
+
   const config: any = {
-    ...(process.env.FIRECRAWL_API_URL && {
-      apiUrl: process.env.FIRECRAWL_API_URL,
+    ...(apiUrl && {
+      apiUrl,
     }),
   };
 
@@ -168,32 +156,103 @@ function createClient(apiKey?: string): FirecrawlApp {
 const ORIGIN = 'mcp-fastmcp';
 
 // Safe mode is enabled by default for cloud service to comply with ChatGPT safety requirements
-const SAFE_MODE = process.env.CLOUD_SERVICE === 'true';
+const SAFE_MODE = false;
+// Self-hosted deployments default to compatibility mode because many forks
+// expose only v1 core endpoints (scrape/map/crawl/status).
+const USE_V1_SELFHOST_API = true;
 
 function getClient(session?: SessionData): FirecrawlApp {
-  // For cloud service, API key is required
-  if (process.env.CLOUD_SERVICE === 'true') {
-    if (!session || !session.firecrawlApiKey) {
-      throw new Error('Unauthorized');
-    }
-    return createClient(session.firecrawlApiKey);
-  }
-
-  // For self-hosted instances, API key is optional if FIRECRAWL_API_URL is provided
-  if (
-    !process.env.FIRECRAWL_API_URL &&
-    (!session || !session.firecrawlApiKey)
-  ) {
-    throw new Error(
-      'Unauthorized: API key is required when not using a self-hosted instance'
-    );
-  }
-
   return createClient(session?.firecrawlApiKey);
 }
 
 function asText(data: unknown): string {
   return JSON.stringify(data, null, 2);
+}
+
+function getSelfHostBaseUrl(): string {
+  return (process.env.FIRECRAWL_API_URL || 'http://localhost:3002').replace(
+    /\/$/,
+    ''
+  );
+}
+
+async function callSelfHostV1(
+  path: string,
+  method: 'GET' | 'POST',
+  session?: SessionData,
+  body?: Record<string, unknown>
+): Promise<unknown> {
+  const headers: Record<string, string> = {};
+  if (session?.firecrawlApiKey) {
+    headers.Authorization = `Bearer ${session.firecrawlApiKey}`;
+  }
+  if (body) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const response = await fetch(`${getSelfHostBaseUrl()}${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Self-host v1 request failed (${response.status}): ${text}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function buildV1ScrapeArgs(options: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+
+  if (Array.isArray(options.formats)) {
+    const allowed = new Set(['markdown', 'rawHtml', 'screenshot']);
+    const mapped = (options.formats as unknown[])
+      .map((x) => String(x))
+      .flatMap((fmt) => (fmt === 'html' ? ['rawHtml'] : [fmt]))
+      .filter((fmt) => allowed.has(fmt));
+    if (mapped.length > 0) out.formats = Array.from(new Set(mapped));
+  }
+
+  if (
+    options.headers &&
+    typeof options.headers === 'object' &&
+    !Array.isArray(options.headers)
+  ) {
+    out.headers = options.headers;
+  }
+  if (Array.isArray(options.includeTags)) out.includeTags = options.includeTags;
+  if (Array.isArray(options.excludeTags)) out.excludeTags = options.excludeTags;
+  if (typeof options.timeout === 'number') out.timeout = options.timeout;
+  if (typeof options.waitFor === 'number') out.waitFor = options.waitFor;
+
+  // v1 uses extract object; map MCP jsonOptions/queryOptions into extract where possible.
+  if (
+    options.jsonOptions &&
+    typeof options.jsonOptions === 'object' &&
+    !Array.isArray(options.jsonOptions)
+  ) {
+    const jsonOptions = options.jsonOptions as Record<string, unknown>;
+    out.extract = removeEmptyTopLevel({
+      mode: 'llm',
+      prompt:
+        typeof jsonOptions.prompt === 'string' ? jsonOptions.prompt : undefined,
+      schema:
+        jsonOptions.schema &&
+        typeof jsonOptions.schema === 'object' &&
+        !Array.isArray(jsonOptions.schema)
+          ? jsonOptions.schema
+          : undefined,
+    });
+  }
+
+  return out;
 }
 
 // scrape tool (v2 semantics, minimal args)
@@ -497,6 +556,18 @@ ${
       string,
       unknown
     >;
+    if (USE_V1_SELFHOST_API) {
+      log.info('Scraping URL (self-host compat)', { url: String(url) });
+      const compatBody: Record<string, unknown> = {
+        url: String(url),
+        ...buildV1ScrapeArgs(options as Record<string, unknown>),
+      };
+      const res = await callSelfHostV1('/v1/scrape', 'POST', session, {
+        ...compatBody,
+      });
+      return asText(res);
+    }
+
     const client = getClient(session);
     const transformed = transformScrapeParams(options as Record<string, unknown>);
     const cleaned = removeEmptyTopLevel(transformed);
@@ -567,6 +638,28 @@ Map a website to discover all indexed URLs on the site.
       string,
       unknown
     >;
+    if (USE_V1_SELFHOST_API) {
+      const compatBody: Record<string, unknown> = {
+        url: String(url),
+      };
+      if (typeof options.limit === 'number') compatBody.limit = options.limit;
+      if (typeof options.includeSubdomains === 'boolean') {
+        compatBody.includeSubdomains = options.includeSubdomains;
+      }
+      if (typeof options.search === 'string' && options.search.trim().length > 0) {
+        compatBody.search = options.search;
+      }
+      // v1 expects ignoreSitemap boolean, while MCP exposes sitemap enum.
+      if (options.sitemap === 'include' || options.sitemap === 'only') {
+        compatBody.ignoreSitemap = false;
+      } else if (options.sitemap === 'skip') {
+        compatBody.ignoreSitemap = true;
+      }
+      log.info('Mapping URL (self-host compat)', { url: String(url) });
+      const res = await callSelfHostV1('/v1/map', 'POST', session, compatBody);
+      return asText(res);
+    }
+
     const client = getClient(session);
     const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
     log.info('Mapping URL', { url: String(url) });
@@ -578,8 +671,9 @@ Map a website to discover all indexed URLs on the site.
   },
 });
 
-server.addTool({
-  name: 'firecrawl_search',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_search',
   annotations: {
     title: 'Search the web',
     readOnlyHint: true,
@@ -702,7 +796,8 @@ The query also supports search operators, that you can use if needed to refine t
     });
     return asText(res);
   },
-});
+  });
+}
 
 server.addTool({
   name: 'firecrawl_crawl',
@@ -766,6 +861,49 @@ server.addTool({
   }),
   execute: async (args, { session, log }) => {
     const { url, ...options } = args as Record<string, unknown>;
+    if (USE_V1_SELFHOST_API) {
+      const compatBody: Record<string, unknown> = {
+        url: String(url),
+      };
+      if (typeof options.limit === 'number') compatBody.limit = options.limit;
+      if (typeof options.allowExternalLinks === 'boolean') {
+        compatBody.allowExternalLinks = options.allowExternalLinks;
+      }
+      if (typeof options.allowSubdomains === 'boolean') {
+        compatBody.allowBackwardLinks = options.allowSubdomains;
+      }
+      if (Array.isArray(options.includePaths)) {
+        compatBody.includePaths = options.includePaths;
+      }
+      if (Array.isArray(options.excludePaths)) {
+        compatBody.excludePaths = options.excludePaths;
+      }
+      if (typeof options.maxDiscoveryDepth === 'number') {
+        compatBody.maxDepth = options.maxDiscoveryDepth;
+      }
+      if (options.sitemap === 'include' || options.sitemap === 'only') {
+        compatBody.ignoreSitemap = false;
+      } else if (options.sitemap === 'skip') {
+        compatBody.ignoreSitemap = true;
+      }
+      // Keep scrapeOptions only if it uses v1-compatible primitives.
+      if (
+        options.scrapeOptions &&
+        typeof options.scrapeOptions === 'object' &&
+        !Array.isArray(options.scrapeOptions)
+      ) {
+        const so = options.scrapeOptions as Record<string, unknown>;
+        const compatScrapeOptions = buildV1ScrapeArgs(so);
+        if (Object.keys(compatScrapeOptions).length > 0) {
+          compatBody.scrapeOptions = compatScrapeOptions;
+        }
+      }
+
+      log.info('Starting crawl (self-host compat)', { url: String(url) });
+      const res = await callSelfHostV1('/v1/crawl', 'POST', session, compatBody);
+      return asText(res);
+    }
+
     const client = getClient(session);
 
     const opts = { ...options } as Record<string, unknown>;
@@ -815,14 +953,23 @@ Check the status of a crawl job.
     args: unknown,
     { session }: { session?: SessionData }
   ): Promise<string> => {
+    if (USE_V1_SELFHOST_API) {
+      const res = await callSelfHostV1(
+        `/v1/crawl/${(args as any).id as string}`,
+        'GET',
+        session
+      );
+      return asText(res);
+    }
     const client = getClient(session);
     const res = await client.getCrawlStatus((args as any).id as string);
     return asText(res);
   },
 });
 
-server.addTool({
-  name: 'firecrawl_extract',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_extract',
   annotations: {
     title: 'Extract structured data',
     readOnlyHint: true,
@@ -894,10 +1041,12 @@ Extract structured information from web pages using LLM capabilities. Supports b
     const res = await client.extract(extractBody as any);
     return asText(res);
   },
-});
+  });
+}
 
-server.addTool({
-  name: 'firecrawl_agent',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_agent',
   annotations: {
     title: 'Start a research agent',
     readOnlyHint: false,
@@ -999,10 +1148,12 @@ Then poll with \`firecrawl_agent_status\` every 15-30 seconds for at least 2-3 m
     });
     return asText(res);
   },
-});
+  });
+}
 
-server.addTool({
-  name: 'firecrawl_agent_status',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_agent_status',
   annotations: {
     title: 'Get agent job status',
     readOnlyHint: true,
@@ -1044,11 +1195,13 @@ Check the status of an agent job and retrieve results when complete. Use this to
     const res = await (client as any).getAgentStatus(id);
     return asText(res);
   },
-});
+  });
+}
 
 // Browser session tools (deprecated — prefer firecrawl_scrape + firecrawl_interact)
-server.addTool({
-  name: 'firecrawl_browser_create',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_browser_create',
   annotations: {
     title: 'Create browser session',
     readOnlyHint: false,
@@ -1099,9 +1252,10 @@ Create a browser session for code execution via CDP (Chrome DevTools Protocol).
     const res = await client.browser(cleaned as any);
     return asText(res);
   },
-});
+  });
+}
 
-if (!SAFE_MODE) {
+if (!SAFE_MODE && !USE_V1_SELFHOST_API) {
   server.addTool({
     name: 'firecrawl_browser_execute',
     annotations: {
@@ -1185,8 +1339,9 @@ Execute code in a browser session. Supports agent-browser commands (bash), Pytho
   });
 }
 
-server.addTool({
-  name: 'firecrawl_browser_delete',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_browser_delete',
   annotations: {
     title: 'Delete browser session',
     readOnlyHint: false,
@@ -1222,10 +1377,12 @@ Destroy a browser session.
     const res = await client.deleteBrowser(sessionId);
     return asText(res);
   },
-});
+  });
+}
 
-server.addTool({
-  name: 'firecrawl_browser_list',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_browser_list',
   annotations: {
     title: 'List browser sessions',
     readOnlyHint: true,
@@ -1260,11 +1417,13 @@ List browser sessions, optionally filtered by status.
     const res = await client.listBrowsers({ status });
     return asText(res);
   },
-});
+  });
+}
 
 // Interact tools (scrape-bound browser sessions)
-server.addTool({
-  name: 'firecrawl_interact',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_interact',
   annotations: {
     title: 'Interact with a scraped page',
     readOnlyHint: false,
@@ -1338,10 +1497,12 @@ Interact with a previously scraped page in a live browser session. Scrape a page
     const res = await client.interact(scrapeId, interactArgs as any);
     return asText(res);
   },
-});
+  });
+}
 
-server.addTool({
-  name: 'firecrawl_interact_stop',
+if (!USE_V1_SELFHOST_API) {
+  server.addTool({
+    name: 'firecrawl_interact_stop',
   annotations: {
     title: 'Stop interact session',
     readOnlyHint: false,
@@ -1375,12 +1536,13 @@ Stop an interact session for a scraped page. Call this when you are done interac
     const res = await client.stopInteraction(scrapeId);
     return asText(res);
   },
-});
+  });
+}
 
 // Local-only: parse a local file via the self-hosted Firecrawl /v2/parse endpoint.
 // The parse endpoint is only exposed on self-hosted/local Firecrawl API deployments,
 // so this tool is registered only when the MCP is NOT running in cloud mode.
-if (process.env.CLOUD_SERVICE !== 'true') {
+if (process.env.CLOUD_SERVICE !== 'true' && !USE_V1_SELFHOST_API) {
   const parseParamsSchema = z.object({
     filePath: z
       .string()
@@ -1538,12 +1700,7 @@ Add \`"parsers": ["pdf"]\` (optionally with \`pdfOptions.maxPages\`) when parsin
       args: unknown,
       { session, log }: { session?: SessionData; log: Logger }
     ): Promise<string> => {
-      const apiUrl = process.env.FIRECRAWL_API_URL;
-      if (!apiUrl) {
-        throw new Error(
-          'firecrawl_parse requires FIRECRAWL_API_URL to be set to a self-hosted Firecrawl API instance.'
-        );
-      }
+      const apiUrl = process.env.FIRECRAWL_API_URL || 'http://localhost:3002';
 
       const {
         filePath,

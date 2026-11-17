@@ -185,7 +185,7 @@ Optionally, you can add it to a file called `.vscode/mcp.json` in your workspace
   - Optional when using self-hosted instance with `FIRECRAWL_API_URL`
 - `FIRECRAWL_API_URL` (Optional): Custom API endpoint for self-hosted instances
   - Example: `https://firecrawl.your-domain.com`
-  - If not provided, the cloud API will be used (requires API key)
+  - In self-host mode, defaults to `http://localhost:3002` when omitted
 
 #### Optional Configuration
 
@@ -200,6 +200,10 @@ Optionally, you can add it to a file called `.vscode/mcp.json` in your workspace
 
 - `FIRECRAWL_CREDIT_WARNING_THRESHOLD`: Credit usage warning threshold (default: 1000)
 - `FIRECRAWL_CREDIT_CRITICAL_THRESHOLD`: Credit usage critical threshold (default: 100)
+
+##### Self-host Compatibility Mode
+
+- In self-host mode, compatibility behavior is always enabled by default (core tools only: `scrape`, `map`, `crawl`, `check_crawl_status`) to support older/lightweight Firecrawl forks that expose only v1 endpoints.
 
 ### Configuration Examples
 
@@ -223,7 +227,7 @@ export FIRECRAWL_CREDIT_CRITICAL_THRESHOLD=500    # Critical at 500 credits
 For self-hosted instance:
 
 ```bash
-# Required for self-hosted
+# Optional for self-hosted (defaults to http://localhost:3002 if omitted)
 export FIRECRAWL_API_URL=https://firecrawl.your-domain.com
 
 # Optional authentication for self-hosted
